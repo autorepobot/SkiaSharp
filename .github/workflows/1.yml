@@ -1,0 +1,151 @@
+# .github/workflows/validate-ppc64le.yml
+# Throwaway workflow to validate ppc64le support on a real amd64 runner
+# (bypasses the local QEMU crash on ARM64 hosts). Not part of the official
+# Azure Pipelines CI — delete before merging unless maintainers want to keep it.
+#
+# This workflow ALSO packs SkiaSharp.NativeAssets.Linux and
+# HarfBuzzSharp.NativeAssets.Linux into throwaway test .nupkg files and
+# publishes them as a prerelease GitHub Release, purely so testers can
+# `dotnet add package --source <release-url>` a ppc64le build without
+# waiting for an official NuGet.org release. These packages are NOT signed,
+# NOT the official SkiaSharp/HarfBuzzSharp packages, and contain native
+# binaries for ppc64le ONLY (all other RIDs are empty in this build).
+name: Validate ppc64le (manual)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - add-ppc64le-support
+
+permissions:
+  contents: write   # required to create a GitHub Release
+
+jobs:
+  build-ppc64le:
+    runs-on: ubuntu-latest   # native amd64, no QEMU needed
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive   # externals/skia + externals/depot_tools are required
+                                   # by the git-sync-deps cake task; they are NOT cloned
+                                   # by the cake task itself.
+
+      - name: Patch libpng BUILD.gn for ppc64le VSX (temporary test only)
+        run: |
+          python3 - <<'PY'
+          path = "externals/skia/third_party/libpng/BUILD.gn"
+          with open(path) as f:
+              content = f.read()
+
+          marker = '"../externals/libpng/loongarch/loongarch_lsx_init.c",\n      ]\n    }\n'
+          patch = '''
+              if (current_cpu == "ppc64" || current_cpu == "ppc64le") {
+                sources += [
+                  "../externals/libpng/powerpc/powerpc_init.c",
+                  "../externals/libpng/powerpc/filter_vsx_intrinsics.c",
+                ]
+              }
+          '''
+          if marker not in content:
+              raise SystemExit(f"FAIL: marker not found in {path}; file layout may have changed, patch manually")
+          content = content.replace(marker, marker + patch)
+          with open(path, "w") as f:
+              f.write(content)
+          print("Patched BUILD.gn successfully")
+          PY
+          echo "--- resulting file ---"
+          cat externals/skia/third_party/libpng/BUILD.gn
+
+      - name: Build glibc-ppc64le Docker image
+        working-directory: scripts/infra/native/linux/docker/glibc-ppc64le
+        run: |
+          docker build --tag skiasharp-ppc64le .
+
+      - name: Run externals-linux-clang-cross for ppc64le
+        run: |
+          docker run --rm \
+            --name skiasharp-ppc64le \
+            --volume "$(pwd)":/work \
+            -w /work \
+            skiasharp-ppc64le \
+            /bin/bash -c "dotnet tool restore && dotnet cake --target=externals-linux-clang-cross --configuration=Release --buildarch=ppc64le --verifyGlibcMax=2.35"
+
+      - name: Check for produced libraries
+        run: |
+          for LIB in libSkiaSharp libHarfBuzzSharp; do
+            SO_PATH="output/native/linux/ppc64le/${LIB}.so"
+            if [ ! -f "$SO_PATH" ]; then
+              echo "FAIL: $SO_PATH was not produced."
+              find output/native/linux -maxdepth 2 -type d || true
+              exit 1
+            fi
+            echo "OK: found $SO_PATH"
+            file "$SO_PATH"
+          done
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Pack test nupkgs (ppc64le only, unsigned, testing only)
+        run: |
+          mkdir -p output/test-nugets
+
+          # These csproj files just glob-match output/native/**/lib*.so via
+          # PackageFile items — architectures with no produced binaries simply
+          # contribute zero matches for that RID, so the resulting nupkgs
+          # only contain runtimes/linux-ppc64le/native/.
+          dotnet pack binding/SkiaSharp.NativeAssets.Linux/SkiaSharp.NativeAssets.Linux.csproj \
+            -c Release \
+            -p:VersionPrefix=0.0.0 \
+            -p:VersionSuffix=ppc64le-test \
+            -p:PackageId=SkiaSharp.NativeAssets.Linux.Ppc64leTest \
+            -o output/test-nugets
+
+          dotnet pack binding/HarfBuzzSharp.NativeAssets.Linux/HarfBuzzSharp.NativeAssets.Linux.csproj \
+            -c Release \
+            -p:VersionPrefix=0.0.0 \
+            -p:VersionSuffix=ppc64le-test \
+            -p:PackageId=HarfBuzzSharp.NativeAssets.Linux.Ppc64leTest \
+            -o output/test-nugets
+
+          echo "--- produced test nupkgs ---"
+          ls -la output/test-nugets
+          for PKG in output/test-nugets/*.nupkg; do
+            echo "=== $PKG ==="
+            unzip -l "$PKG" | grep -i runtimes || echo "(no runtimes/ entries found)"
+          done
+
+      - name: Publish test nupkgs as a prerelease GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ppc64le-test-${{ github.run_id }}
+          name: "ppc64le test build (${{ github.sha }})"
+          prerelease: true
+          body: |
+            **UNOFFICIAL, UNSIGNED test build — ppc64le validation only.**
+
+            These packages are produced by a throwaway validation workflow
+            (`.github/workflows/validate-ppc64le.yml`), not the official
+            SkiaSharp/HarfBuzzSharp release pipeline. They contain native
+            binaries for **ppc64le only** — all other RIDs are absent/empty.
+
+            Do NOT use these in production. They exist solely so testers can
+            validate the ppc64le native build without waiting for an official
+            NuGet.org release.
+
+            Commit: ${{ github.sha }}
+          files: output/test-nugets/*.nupkg
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppc64le-build-logs
+          path: |
+            externals/skia/out/**/*.ninja_log
+            externals/skia/out/**/args.gn
+            output/**/*.log
