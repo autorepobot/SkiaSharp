@@ -72,6 +72,10 @@ jobs:
             skiasharp-ppc64le \
             /bin/bash -c "dotnet tool restore && dotnet cake --target=externals-linux-clang-cross --configuration=Release --buildarch=ppc64le --verifyGlibcMax=2.35"
 
+      - name: Fix output workspace permissions
+        if: always()
+        run: sudo chown -R $(id -u):$(id -g) .
+
       - name: Check for produced libraries
         run: |
           for LIB in libSkiaSharp libHarfBuzzSharp; do
